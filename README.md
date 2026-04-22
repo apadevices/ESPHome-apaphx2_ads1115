@@ -43,7 +43,7 @@ pH and ORP/RX measurement via ADS1115 16-bit ADC with full galvanic isolation, g
 
 ## Hardware Overview
 
-> **PCB schematics, dimensional drawings and connector pinout diagrams** are available in the Arduino library hardware folder:
+> **Photos, all the specs and connector pinout diagrams** are available in the Arduino library hardware folder:
 > https://github.com/apadevices/APAPHX2_ADS1115/tree/main/extras/hardware
 
 The APADevices PHX v2 board provides two fully isolated electrochemical measurement channels on a single PCB.
