@@ -1,0 +1,544 @@
+# =============================================================================
+# ESPHome configuration example for APADevices PHX v2 pool monitoring board
+# Component: apaphx_ads1115 v1.1.0
+# Board:     ESP32 (esp32dev)
+# =============================================================================
+#
+# HARDWARE CONNECTIONS
+# --------------------
+# PHX v2 P1 connector → ESP32:
+#   Pin 10 (GND-MC1)  → GND
+#   Pin 9  (Vcc-MC1)  → 3.3V
+#   Pin 8  (SCL-MC1)  → GPIO22
+#   Pin 7  (SDA-MC1)  → GPIO21
+#
+# PHX v2 CN2 connector → 12V DC power supply (isolated analog side)
+#
+# Additional sensors on this example:
+#   GPIO32 → DS18B20 OneWire temperature probe (water temperature)
+#   GPIO33 → Analog pressure sensor (0.5V–3.4V range, 0–3.7 bar)
+#   GPIO25 → Pump status input (active low, INPUT_PULLUP)
+#
+# SECRETS
+# -------
+# Create a secrets.yaml file in your ESPHome config directory:
+#   wifi_ssid: "YourNetworkName"
+#   wifi_password: "YourNetworkPassword"
+# =============================================================================
+
+esphome:
+  name: phx2-probe
+  friendly_name: PHX2-poolmonitor
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Logging -- set to WARNING for production, DEBUG for troubleshooting
+# Note: apaphx_ads1115 logs calibration progress at INFO level
+logger:
+  level: DEBUG
+  logs:
+    adc.sensor: DEBUG
+    sensor: DEBUG
+
+# Home Assistant API -- generate your own key with:
+# esphome -c . run --generate-key
+api:
+  encryption:
+    key: "YOUR_API_ENCRYPTION_KEY_HERE"
+
+# OTA updates -- change password before flashing
+ota:
+  - platform: esphome
+    password: "YOUR_OTA_PASSWORD_HERE"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Optional: remove manual_ip to use DHCP
+  # manual_ip:
+  #   static_ip: 192.168.1.100
+  #   gateway: 192.168.1.1
+  #   subnet: 255.255.255.0
+
+  # Fallback hotspot -- activates when main WiFi is unreachable
+  ap:
+    ssid: "PHX2-Poolmonitor"
+    password: "YOUR_FALLBACK_AP_PASSWORD_HERE"
+
+# Direct web access -- optional, remove if not needed
+web_server:
+  port: 80
+
+# =============================================================================
+# APADevices PHX2 ADS1115 component
+# Source: components/ folder (local) or GitHub URL
+# =============================================================================
+external_components:
+  - source: components
+    components: [apaphx_ads1115]
+
+# =============================================================================
+# I2C bus -- PHX v2 uses two ADS1115 on the same bus
+#   pH  ADS1115: address 0x49
+#   ORP ADS1115: address 0x48
+# =============================================================================
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true   # logs discovered I2C addresses on boot -- disable in production
+
+# =============================================================================
+# OneWire bus -- DS18B20 water temperature probe
+# =============================================================================
+one_wire:
+  - platform: gpio
+    pin: GPIO32
+    id: hub_1
+
+# =============================================================================
+# Number entities -- HA-configurable soft limits
+# Adjustable at runtime from Home Assistant UI
+# Persisted across reboots via restore_value: true
+# =============================================================================
+number:
+  - platform: template
+    name: "pH Low Limit"
+    id: ph_low_limit
+    min_value: 6.0
+    max_value: 7.5
+    step: 0.1
+    restore_value: true
+    initial_value: 7.1    # typical pool target: 7.2-7.6
+    optimistic: true
+    icon: mdi:ph
+    entity_category: config
+
+  - platform: template
+    name: "pH High Limit"
+    id: ph_high_limit
+    min_value: 7.0
+    max_value: 8.0
+    step: 0.1
+    restore_value: true
+    initial_value: 7.6
+    optimistic: true
+    icon: mdi:ph
+    entity_category: config
+
+  - platform: template
+    name: "ORP Low Limit"
+    id: orp_low_limit
+    min_value: 400
+    max_value: 800
+    step: 10
+    restore_value: true
+    initial_value: 650    # effective sanitization starts around 650mV
+    optimistic: true
+    unit_of_measurement: mV
+    icon: mdi:waves
+    entity_category: config
+
+  - platform: template
+    name: "ORP High Limit"
+    id: orp_high_limit
+    min_value: 600
+    max_value: 1000
+    step: 10
+    restore_value: true
+    initial_value: 850
+    optimistic: true
+    unit_of_measurement: mV
+    icon: mdi:waves
+    entity_category: config
+
+# =============================================================================
+# Binary sensors
+# =============================================================================
+binary_sensor:
+  # Pump status -- GPIO input from pump relay feedback
+  # delayed_on: 10s debounces the hardware signal
+  # The apaphx_ads1115 component adds an additional 30s stabilization
+  # delay after pump start before publishing pH/ORP readings.
+  # Total delay from pump start to first valid reading: ~40s
+  - platform: gpio
+    pin:
+      number: GPIO25
+      mode: INPUT_PULLUP
+      inverted: true      # active low -- adjust to match your wiring
+    name: "Pump Status"
+    id: pump_status
+    device_class: "power"
+    filters:
+      - delayed_on: 10s
+      - delayed_off: 0s
+
+  # Calibration age warning -- fires when either probe exceeds 40 days
+  # Adjust threshold to match your maintenance schedule
+  - platform: template
+    name: "Calibration Warning"
+    id: cal_warning
+    device_class: problem
+    lambda: |-
+      if (id(ph_cal_age).state > 40 || id(orp_cal_age).state > 40) {
+        return true;
+      }
+      return false;
+
+# =============================================================================
+# Sensors
+# =============================================================================
+sensor:
+  # WiFi signal and uptime -- diagnostics, shown in HA device page
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+    filters:
+      - lambda: return x / 3600.0;   # convert seconds to hours
+    unit_of_measurement: "h"
+    entity_category: diagnostic
+
+  # Temperature status -- passes through raw temperature only when pump is running
+  # Holds last known value when pump is off to avoid spurious NaN readings
+  - platform: template
+    name: "Temp Status"
+    id: temp_status
+    accuracy_decimals: 1
+    unit_of_measurement: "°C"
+    device_class: "temperature"
+    update_interval: 5s
+    lambda: |-
+      if (id(pump_status).state) {
+        if (id(pool_temp_raw).state) {
+          return id(pool_temp_raw).state;
+        }
+      }
+      return id(temp_status).state;
+
+  # Pressure status -- passes through raw pressure only when pump is running
+  # Holds last known value when pump is off
+  - platform: template
+    name: "Pressure Status"
+    id: pressure_status
+    unit_of_measurement: "bar"
+    accuracy_decimals: 1
+    icon: "mdi:gauge"
+    update_interval: 5s
+    device_class: "pressure"
+    lambda: |-
+      if (id(pump_status).state) {
+        return id(analog_pressure).state;
+      } else {
+        return id(pressure_status).state;
+      }
+
+  # Raw pressure ADC -- internal, not published to HA directly
+  # calibrate_linear maps ADC voltage to bar
+  # Adjust calibration points to match your pressure sensor datasheet
+  - platform: adc
+    pin: GPIO33
+    id: analog_pressure
+    internal: true
+    update_interval: 5s
+    filters:
+      - median:
+          window_size: 10
+          send_every: 5
+          send_first_at: 5
+      - calibrate_linear:
+          - 0.5 -> 0       # 0.5V = 0 bar (sensor zero point)
+          - 3.38775 -> 3.7 # 3.39V = 3.7 bar (sensor max) -- adjust to your sensor
+
+  # DS18B20 pool temperature -- internal, filtered before use
+  - platform: dallas_temp
+    one_wire_id: hub_1
+    id: pool_temp_raw
+    resolution: 11        # 11-bit = 0.125°C resolution, ~375ms conversion
+    update_interval: 5s
+    internal: true
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 2
+          send_first_at: 2
+      - filter_out: nan   # discard failed reads
+      - delta: 1.0        # only propagate changes > 1°C
+      - heartbeat: 60s    # force publish at least every 60s
+
+  # ==========================================================================
+  # APADevices PHX2 ADS1115 -- pH and ORP measurement
+  #
+  # IMPORTANT: phx_sensor is the single component instance for BOTH pH and ORP.
+  # All calibration actions (calibrate_ph1/2, calibrate_orp1/2, reset) use
+  # id: phx_sensor regardless of which channel is being calibrated.
+  #
+  # Known behavior: update() blocks ~220ms per cycle due to 10-sample trimmed
+  # mean filter. ESPHome logs a harmless "took a long time" warning. This will
+  # be resolved in v1.2.0 with a non-blocking state machine.
+  # ==========================================================================
+  - platform: apaphx_ads1115
+    name: "RAW pH Volts"      # raw differential voltage from pH ADS1115
+    id: phx_sensor
+    address: 0x49             # pH ADS1115 I2C address
+    gain: 2                   # ±2.048V range, LSB=62.5μV
+    update_interval: 5s
+
+    # Link to temperature sensor for pH compensation (Pasco 2001 formula)
+    temperature_sensor: temp_status
+
+    # Link to pump sensor -- suppresses readings 30s after pump starts
+    pump_sensor: pump_status
+
+    # Link soft limits to HA-configurable number entities
+    ph_low_number: ph_low_limit
+    ph_high_number: ph_high_limit
+    orp_low_number: orp_low_limit
+    orp_high_number: orp_high_limit
+
+    # Alert binary sensors -- ON when reading is outside soft limits
+    # Hysteresis: 0.1 pH / 10 mV to prevent rapid toggling at threshold
+    ph_alert:
+      name: "pH Alert"
+      id: ph_alert
+    orp_alert:
+      name: "ORP Alert"
+      id: orp_alert
+
+    # Calibration status -- ON after successful two-point calibration
+    # OFF after reset_calibration action
+    ph_calibrated:
+      name: "pH Calibrated"
+      id: ph_calibrated
+    orp_calibrated:
+      name: "ORP Calibrated"
+      id: orp_calibrated
+
+    # Calibrated pH value -- temperature compensated
+    ph_sensor:
+      name: "pH Value"
+      id: ph_value
+      icon: "mdi:ph"
+      filters:
+        - delta: 0.05       # suppress noise below 0.05 pH
+        - heartbeat: 30s    # force publish every 30s regardless
+
+    # ORP channel -- separate ADS1115 on address 0x48
+    orp:
+      address: 0x48         # ORP ADS1115 I2C address
+      gain: 4               # ±4.096V range, LSB=125μV -- covers full ±2000mV range
+      orp_sensor:
+        name: "ORP Value"
+        id: orp_value
+        icon: "mdi:waves"
+        filters:
+          - delta: 1        # suppress noise below 1mV
+          - heartbeat: 30s
+      voltage_sensor:
+        name: "RAW ORP Volts"   # raw differential voltage -- useful for diagnostics
+
+    # Calibration age -- days since last successful calibration
+    # Returns NaN before NTP time sync is available
+    ph_calibration_age:
+      name: "pH Calibration Age"
+      id: ph_cal_age
+      filters:
+        - delta: 0.5        # publish only when age changes by 0.5 day
+    orp_calibration_age:
+      name: "ORP Calibration Age"
+      id: orp_cal_age
+      filters:
+        - delta: 0.5
+
+  # ==========================================================================
+  # Water Quality Score (0-100)
+  # Composite index: pH sub-score (55pts) + ORP sub-score (45pts)
+  #
+  # pH scoring:
+  #   7.2-7.6 → full 55pts (ideal zone)
+  #   6.8-7.2 → linear decay to 0pts
+  #   7.6-8.0 → linear decay to 0pts
+  #   outside  → 0pts
+  #
+  # ORP scoring:
+  #   ≥750mV   → full 45pts (ideal zone)
+  #   400-750  → linear decay to 0pts
+  #   <400mV   → 0pts
+  #
+  # Score bands: 90-100 Excellent / 70-89 Good / 50-69 Fair / 30-49 Poor / 0-29 Critical
+  # ==========================================================================
+  - platform: template
+    name: "Water Quality Score"
+    id: water_quality_score
+    icon: "mdi:water-check"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    state_class: measurement
+    update_interval: 5s
+    lambda: |-
+      if (isnan(id(ph_value).state) || isnan(id(orp_value).state)) {
+        return 0;
+      }
+      float ph  = id(ph_value).state;
+      float orp = id(orp_value).state;
+
+      // pH sub-score (0-55 points)
+      float ph_score = 0.0f;
+      if (ph >= 7.2f && ph <= 7.6f) {
+        ph_score = 55.0f;
+      } else if (ph < 7.2f && ph > 6.8f) {
+        ph_score = 55.0f * (ph - 6.8f) / (7.2f - 6.8f);
+      } else if (ph > 7.6f && ph < 8.0f) {
+        ph_score = 55.0f * (8.0f - ph) / (8.0f - 7.6f);
+      }
+
+      // ORP sub-score (0-45 points)
+      float orp_score = 0.0f;
+      if (orp >= 750.0f) {
+        orp_score = 45.0f;
+      } else if (orp > 400.0f) {
+        orp_score = 45.0f * (orp - 400.0f) / (750.0f - 400.0f);
+      }
+
+      // Total score clamped 0-100
+      float score = ph_score + orp_score;
+      if (score < 0.0f)   score = 0.0f;
+      if (score > 100.0f) score = 100.0f;
+      return (int)score;
+
+# =============================================================================
+# Text sensors
+# =============================================================================
+text_sensor:
+  # Calibration status -- updated by calibration button lambdas
+  - platform: template
+    name: "Calibration Status"
+    id: calibration_status
+    icon: mdi:flask
+
+  # PHX status -- simple text summary of current water state
+  - platform: template
+    name: "PHX Status"
+    icon: mdi:bell-alert-outline
+    lambda: |-
+      if (id(ph_value).state > id(ph_high_limit).state)
+        return {"pH High"};
+      if (id(ph_value).state < id(ph_low_limit).state)
+        return {"pH Low"};
+      if (id(orp_value).state < id(orp_low_limit).state)
+        return {"ORP Low"};
+      return {"OK"};
+
+  # Water quality label -- human readable band from Water Quality Score
+  - platform: template
+    name: "Water Quality"
+    icon: mdi:water-check
+    lambda: |-
+      int score = (int)id(water_quality_score).state;
+      if (score >= 90) return {"Excellent"};
+      if (score >= 70) return {"Good"};
+      if (score >= 50) return {"Fair"};
+      if (score >= 30) return {"Poor"};
+      return {"Critical"};
+
+  # Filter pressure status -- text label for pressure trend card in HA
+  # Adjust thresholds to match your filter and piping system
+  - platform: template
+    name: "Filter Pressure Status"
+    icon: mdi:gauge
+    update_interval: 60s
+    lambda: |-
+      if (id(analog_pressure).state > 2.0)
+        return {"Critical - Immediate Backwash Required"};
+      if (id(analog_pressure).state > 1.5)
+        return {"High Pressure - Schedule Backwash"};
+      if (id(analog_pressure).state > 1.2)
+        return {"Elevated - Monitor Pressure"};
+      return {"Normal"};
+
+# =============================================================================
+# Buttons -- calibration and system control
+#
+# CALIBRATION PROCEDURE:
+# 1. Prepare fresh buffer solutions and rinse the probe with distilled water
+# 2. Place probe in first buffer solution
+# 3. Press calibration button -- component will soak for 220s then auto-detect stability
+# 4. Rinse probe, place in second buffer solution, repeat
+# 5. Check ESPHome log for slope validation result after pH point 2
+#
+# The ESP32 blocks during calibration (~4-6 minutes per point).
+# Home Assistant will disconnect and reconnect automatically.
+# =============================================================================
+button:
+  - platform: template
+    name: "Calibrate pH 4.0"
+    icon: mdi:test-tube
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Starting pH 4.0 calibration...");
+      - calibrate_ph1:
+          id: phx_sensor   # phx_sensor is the single instance for both pH and ORP
+          value: 4.0
+      - delay: 2s
+      - lambda: |-
+          id(calibration_status).publish_state("pH 4.0 calibration complete");
+
+  - platform: template
+    name: "Calibrate pH 7.0"
+    icon: mdi:test-tube
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Starting pH 7.0 calibration...");
+      - calibrate_ph2:
+          id: phx_sensor
+          value: 7.0
+      - delay: 2s
+      - lambda: |-
+          id(calibration_status).publish_state("pH 7.0 calibration complete");
+
+  - platform: template
+    name: "Calibrate ORP 475mV"
+    icon: mdi:test-tube
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Starting ORP 475mV calibration...");
+      - calibrate_orp1:
+          id: phx_sensor   # phx_sensor is the single instance for both pH and ORP
+          value: 475
+      - delay: 2s
+      - lambda: |-
+          id(calibration_status).publish_state("ORP 475mV calibration complete");
+
+  - platform: template
+    name: "Calibrate ORP 650mV"
+    icon: mdi:test-tube
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Starting ORP 650mV calibration...");
+      - calibrate_orp2:
+          id: phx_sensor
+          value: 650
+      - delay: 2s
+      - lambda: |-
+          id(calibration_status).publish_state("ORP 650mV calibration complete");
+
+  - platform: template
+    name: "Reset Calibration"
+    icon: mdi:restart
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Resetting calibration...");
+      - reset_calibration:
+          id: phx_sensor
+      - delay: 1s
+      - lambda: |-
+          id(calibration_status).publish_state("Calibration reset complete");
+
+  - platform: restart
+    name: "Restart Device"

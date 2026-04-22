@@ -1,0 +1,381 @@
+esphome:
+  name: phx2-probe
+  friendly_name: PHX2-poolmonitor
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+  level: DEBUG
+  logs:
+    adc.sensor: DEBUG
+    sensor: DEBUG
+    esp32.temperature: DEBUG
+
+api:
+  encryption:
+    key: "GHSIU5V15DLNfC8OPhz4nJ30AlN23SI9DbvkcogAhDk="
+
+ota:
+  - platform: esphome
+    password: "79578ad938972c7416e7e49865f7b96c"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: 192.168.10.25
+    gateway: 192.168.10.254
+    subnet: 255.255.255.0
+  ap:
+    ssid: "PHX2-Poolmonitor"
+    password: "fusMaG4sNZqt"
+
+# Direct access
+web_server:
+  port: 80
+
+# APADevices PHX2 ESPHome component
+external_components:
+  - source: components
+    components: [apaphx_ads1115]
+
+# I2C bus -- connection to PHX board
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  scan: true
+
+# Temperature sensor bus
+one_wire:
+  - platform: gpio
+    pin: GPIO32
+    id: hub_1
+
+# ============================================================
+# Number entities -- HA-configurable soft limits
+# Adjustable at runtime from HA, persisted across reboots
+# ============================================================
+number:
+  - platform: template
+    name: "pH Low Limit"
+    id: ph_low_limit
+    min_value: 6.0
+    max_value: 7.5
+    step: 0.1
+    restore_value: true
+    initial_value: 7.1
+    optimistic: true
+    icon: mdi:ph
+    entity_category: config
+
+  - platform: template
+    name: "pH High Limit"
+    id: ph_high_limit
+    min_value: 7.0
+    max_value: 8.0
+    step: 0.1
+    restore_value: true
+    initial_value: 7.6
+    optimistic: true
+    icon: mdi:ph
+    entity_category: config
+
+  - platform: template
+    name: "ORP Low Limit"
+    id: orp_low_limit
+    min_value: 400
+    max_value: 800
+    step: 10
+    restore_value: true
+    initial_value: 650
+    optimistic: true
+    unit_of_measurement: mV
+    icon: mdi:waves
+    entity_category: config
+
+  - platform: template
+    name: "ORP High Limit"
+    id: orp_high_limit
+    min_value: 600
+    max_value: 1000
+    step: 10
+    restore_value: true
+    initial_value: 850
+    optimistic: true
+    unit_of_measurement: mV
+    icon: mdi:waves
+    entity_category: config
+
+# ============================================================
+# Binary sensors
+# ============================================================
+binary_sensor:
+  # Pump status input
+  - platform: gpio
+    pin:
+      number: GPIO25
+      mode: INPUT_PULLUP
+      inverted: true
+    name: "Pump Status"
+    id: pump_status
+    device_class: "power"
+    filters:
+      - delayed_on: 10s    # Built-in delay before readings start
+      - delayed_off: 0s    # Immediate stop when pump turns off
+
+  # Calibration age warning
+  - platform: template
+    name: "Calibration Warning"
+    id: cal_warning
+    device_class: problem
+    lambda: |-
+      if (id(ph_cal_age).state > 40 || id(orp_cal_age).state > 40) {
+        return true;
+      }
+      return false;
+
+# ============================================================
+# Sensors
+# ============================================================
+sensor:
+  # System monitoring -- independent from pump state
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+    entity_category: diagnostic
+
+  - platform: uptime
+    name: "Uptime"
+    update_interval: 60s
+    filters:
+      - lambda: return x / 3600.0;  # Convert to hours
+    unit_of_measurement: "h"
+    entity_category: diagnostic
+
+  # Temperature -- keeps last value when pump is off
+  - platform: template
+    name: "Temp Status"
+    id: temp_status
+    accuracy_decimals: 1
+    unit_of_measurement: "°C"
+    device_class: "temperature"
+    update_interval: 5s
+    lambda: |-
+      if (id(pump_status).state) {
+        if (id(pool_temp_raw).state) {
+          return id(pool_temp_raw).state;
+        }
+      }
+      return id(temp_status).state;
+
+  # Pressure -- keeps last value when pump is off
+  - platform: template
+    name: "Pressure Status"
+    id: pressure_status
+    unit_of_measurement: "bar"
+    accuracy_decimals: 1
+    icon: "mdi:gauge"
+    update_interval: 5s
+    device_class: "pressure"
+    lambda: |-
+      if (id(pump_status).state) {
+        return id(analog_pressure).state;
+      } else {
+        return id(pressure_status).state;
+      }
+
+  # Pressure sensor -- raw, internal
+  - platform: adc
+    pin: GPIO33
+    id: analog_pressure
+    internal: true
+    update_interval: 5s
+    filters:
+      - median:
+          window_size: 10
+          send_every: 5
+          send_first_at: 5
+      - calibrate_linear:
+          - 0.5 -> 0
+          - 3.38775 -> 3.7
+
+  # Pool temperature -- raw, internal
+  - platform: dallas_temp
+    one_wire_id: hub_1
+    id: pool_temp_raw
+    name: "apa-Temp"
+    resolution: 11
+    update_interval: 5s
+    internal: true
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 2
+          send_first_at: 2
+      - filter_out: nan
+      - delta: 1.0
+      - heartbeat: 60s
+
+  # pH/ORP -- APADevices PHX2 ADS1115 component
+  - platform: apaphx_ads1115
+    name: "RAW pH Volts"
+    id: ph_voltage
+    address: 0x49
+    gain: 2
+    update_interval: 5s
+    # Linked sensors
+    temperature_sensor: temp_status
+    pump_sensor: pump_status
+    # Soft limits -- wired to HA-configurable number entities
+    ph_low_number: ph_low_limit
+    ph_high_number: ph_high_limit
+    orp_low_number: orp_low_limit
+    orp_high_number: orp_high_limit
+    # Alert binary sensors
+    ph_alert:
+      name: "pH Alert"
+      id: ph_alert
+    orp_alert:
+      name: "ORP Alert"
+      id: orp_alert
+    # pH sensor
+    ph_sensor:
+      name: "pH Value"
+      id: ph_value
+      icon: "mdi:ph"
+      filters:
+        - delta: 0.05
+        - heartbeat: 30s
+    # ORP sensor
+    orp:
+      address: 0x48
+      gain: 4
+      orp_sensor:
+        name: "ORP Value"
+        id: orp_value
+        icon: "mdi:waves"
+        filters:
+          - delta: 1
+          - heartbeat: 30s
+      voltage_sensor:
+        name: "RAW ORP Volts"
+    # Calibration age tracking
+    ph_calibration_age:
+      name: "pH Calibration Age"
+      id: ph_cal_age
+      filters:
+        - delta: 0.5
+    orp_calibration_age:
+      name: "ORP Calibration Age"
+      id: orp_cal_age
+      filters:
+        - delta: 0.5
+
+# ============================================================
+# Text sensors -- monitoring and diagnostics
+# ============================================================
+text_sensor:
+  - platform: template
+    name: "Calibration Status"
+    id: calibration_status
+    icon: mdi:flask
+
+  - platform: template
+    name: "PHX Status"
+    icon: mdi:bell-alert-outline
+    lambda: |-
+      if (id(ph_value).state > id(ph_high_limit).state)
+        return {"pH High"};
+      if (id(ph_value).state < id(ph_low_limit).state)
+        return {"pH Low"};
+      if (id(orp_value).state < id(orp_low_limit).state)
+        return {"ORP Low"};
+      return {"OK"};
+
+  - platform: template
+    name: "Filter Pressure Status"
+    icon: mdi:gauge
+    update_interval: 60s
+    lambda: |-
+      if (id(analog_pressure).state > 2.0)
+        return {"Critical - Immediate Backwash Required"};
+      if (id(analog_pressure).state > 1.5)
+        return {"High Pressure - Schedule Backwash"};
+      if (id(analog_pressure).state > 1.2)
+        return {"Elevated - Monitor Pressure"};
+      return {"Normal"};
+
+# ============================================================
+# Buttons -- calibration and system
+# ============================================================
+button:
+  - platform: template
+    name: "Calibrate pH 4.0"
+    icon: mdi:test-tube
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Starting pH 4.0 calibration...");
+      - calibrate_ph1:
+          id: ph_voltage
+          value: 4.0
+      - delay: 2s
+      - lambda: |-
+          id(calibration_status).publish_state("pH 4.0 calibration complete");
+
+  - platform: template
+    name: "Calibrate pH 7.0"
+    icon: mdi:test-tube
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Starting pH 7.0 calibration...");
+      - calibrate_ph2:
+          id: ph_voltage
+          value: 7.0
+      - delay: 2s
+      - lambda: |-
+          id(calibration_status).publish_state("pH 7.0 calibration complete");
+
+  - platform: template
+    name: "Calibrate ORP 475mV"
+    icon: mdi:test-tube
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Starting ORP 475mV calibration...");
+      - calibrate_orp1:
+          id: ph_voltage
+          value: 475
+      - delay: 2s
+      - lambda: |-
+          id(calibration_status).publish_state("ORP 475mV calibration complete");
+
+  - platform: template
+    name: "Calibrate ORP 650mV"
+    icon: mdi:test-tube
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Starting ORP 650mV calibration...");
+      - calibrate_orp2:
+          id: ph_voltage
+          value: 650
+      - delay: 2s
+      - lambda: |-
+          id(calibration_status).publish_state("ORP 650mV calibration complete");
+
+  - platform: template
+    name: "Reset Calibration"
+    icon: mdi:restart
+    on_press:
+      - lambda: |-
+          id(calibration_status).publish_state("Resetting calibration...");
+      - reset_calibration:
+          id: ph_voltage
+      - delay: 1s
+      - lambda: |-
+          id(calibration_status).publish_state("Calibration reset complete");
+
+  - platform: restart
+    name: "Restart Device"
